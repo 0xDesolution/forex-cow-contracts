@@ -68,17 +68,11 @@ import "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/token/ERC20/utils/SafeERC20Upgradeable.sol";
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 
-// Interface for Cow Settlement
-interface ICowSettlement {
-    function vaultRelayer() external view returns (address);
-    function setPreSignature(bytes calldata orderUid, bool signed) external;
-}
-
 // Import LiquidityGauge
 import "./LiquidityGauge.sol";
 
 /// @title ForexCurvePool
-/// @notice A liquidity pool implementing Curve V2 mathematical functions with Cow Protocol integration and enhanced security
+/// @notice A liquidity pool implementing Curve V2 mathematical functions with enhanced security and fee distribution
 contract ForexCurvePool is
     UUPSUpgradeable,
     OwnableUpgradeable,
@@ -100,17 +94,20 @@ contract ForexCurvePool is
     // Amplification coefficient (A)
     uint256 public amplification;
 
-    // Fee percentage (in basis points, e.g., 30 = 0.3%)
+    // Fee percentage (e.g., 0.3% = 3,000,000)
     uint256 public fee;
 
-    // Admin fee percentage (portion of fee kept for admin/governance)
+    // Admin fee percentage (e.g., 50% = 5,000,000,000)
     uint256 public adminFee;
 
     // Total balances of each token in the pool
     mapping(uint256 => uint256) public balances;
 
-    // Reference to the Cow Settlement contract
-    ICowSettlement public cowSettlement;
+    // Mapping to track accumulated admin fees for each token
+    mapping(uint256 => uint256) public adminBalances;
+
+    // Address of the fee collector (protocol)
+    address public feeCollector;
 
     // Reference to the LiquidityGauge contract
     LiquidityGauge public liquidityGauge;
@@ -135,18 +132,14 @@ contract ForexCurvePool is
     /// @param _decimals Decimals of the tokens
     /// @param _oracles Addresses of Chainlink price oracles for the tokens
     /// @param _amplification Amplification coefficient (A)
-    /// @param _fee Trading fee percentage in basis points
-    /// @param _adminFee Admin fee percentage in basis points
-    /// @param _cowSettlementAddress Address of the Cow Settlement contract
+    /// @param _feeCollectorAddress Address of the fee collector (protocol)
     /// @param _liquidityGaugeAddress Address of the LiquidityGauge contract
     function initialize(
         address[] memory _coins,
         uint256[] memory _decimals,
         address[] memory _oracles,
         uint256 _amplification,
-        uint256 _fee,
-        uint256 _adminFee,
-        address _cowSettlementAddress,
+        address _feeCollectorAddress,
         address _liquidityGaugeAddress
     ) public initializer {
         require(_coins.length == _decimals.length, "Coins and decimals length mismatch");
@@ -169,10 +162,15 @@ contract ForexCurvePool is
         }
 
         amplification = _amplification;
-        fee = _fee;
-        adminFee = _adminFee;
-        require(_cowSettlementAddress != address(0), "Invalid Cow Settlement address");
-        cowSettlement = ICowSettlement(_cowSettlementAddress);
+
+        // Set fee to 0.3% (3,000,000)
+        fee = 3000000;
+
+        // Set admin fee to 50% (5,000,000,000)
+        adminFee = 5000000000;
+
+        require(_feeCollectorAddress != address(0), "Invalid fee collector address");
+        feeCollector = _feeCollectorAddress;
         require(_liquidityGaugeAddress != address(0), "Invalid LiquidityGauge address");
         liquidityGauge = LiquidityGauge(_liquidityGaugeAddress);
     }
@@ -249,56 +247,68 @@ contract ForexCurvePool is
         emit RemoveLiquidity(msg.sender, amounts, lpTokenAmount);
     }
 
-    /// @notice Swaps tokens using the pool's liquidity, callable by Cow Protocol's settlement contract
+    /// @notice Swaps tokens using Curve's own swapping mechanism
     /// @param i Index of the token to sell
     /// @param j Index of the token to buy
     /// @param dx Amount of token i to sell
     /// @param minDy Minimum amount of token j to receive (slippage protection)
-    /// @param recipient Address to receive the output tokens
     /// @return dy Amount of token j actually transferred
     function exchange(
         uint256 i,
         uint256 j,
         uint256 dx,
-        uint256 minDy,
-        address recipient
+        uint256 minDy
     ) external nonReentrant returns (uint256 dy) {
         require(i != j, "Cannot exchange the same token");
         require(i < coins.length && j < coins.length, "Token index out of range");
         require(dx > 0, "dx must be greater than zero");
-        require(recipient != address(0), "Invalid recipient address");
 
-        // Ensure only Cow Protocol's settlement contract can call this function
-        require(msg.sender == address(cowSettlement), "Unauthorized caller");
-
-        // Transfer dx amount of token i from Cow Protocol to pool
+        // Transfer dx amount of token i from user to pool
         coins[i].token.safeTransferFrom(msg.sender, address(this), dx);
 
         // Update balances
         balances[i] += dx;
 
+        // Get current XP values
+        uint256[] memory xp = getXP();
+
         // Calculate dy amount of token j using Curve formula
-        dy = getDy(i, j, dx);
+        dy = getDy(i, j, dx, xp);
         require(dy >= minDy, "Slippage limit reached");
 
-        // Apply fee
-        uint256 dyFee = (dy * fee) / FEE_DENOMINATOR;
-        uint256 dyAdminFee = (dyFee * adminFee) / FEE_DENOMINATOR;
-        uint256 dyTransfer = dy - dyFee;
+        // Calculate fee amounts
+        uint256 feeAmount = (dy * fee) / FEE_DENOMINATOR;
+        uint256 adminFeeAmount = (feeAmount * adminFee) / FEE_DENOMINATOR;
+        uint256 lpFeeAmount = feeAmount - adminFeeAmount;
+
+        // Net amount to transfer to user
+        uint256 dyNet = dy - feeAmount;
 
         // Update balances
-        balances[j] -= dyTransfer;
+        balances[j] = balances[j] - dyNet;
 
-        // Fee handling (e.g., send admin fee to fee collector)
-        // Implement fee collection logic as needed
-        // For example:
-        // balances[j] -= dyAdminFee;
-        // coins[j].token.safeTransfer(feeCollector, dyAdminFee);
+        // Update admin balances
+        adminBalances[j] += adminFeeAmount;
 
-        // Transfer dy amount of token j to recipient
-        coins[j].token.safeTransfer(recipient, dyTransfer);
+        // Remaining fee (lpFeeAmount) stays in the pool, benefiting liquidity providers
 
-        emit TokenExchange(recipient, i, dx, j, dyTransfer);
+        // Transfer dyNet amount of token j to user
+        coins[j].token.safeTransfer(msg.sender, dyNet);
+
+        emit TokenExchange(msg.sender, i, dx, j, dyNet);
+    }
+
+    /// @notice Withdraws accumulated admin fees to the fee collector address
+    function withdrawAdminFees() external {
+        require(msg.sender == feeCollector, "Only fee collector can withdraw admin fees");
+        for (uint256 i = 0; i < coins.length; i++) {
+            uint256 amount = adminBalances[i];
+            if (amount > 0) {
+                adminBalances[i] = 0;
+                balances[i] = balances[i] - amount;
+                coins[i].token.safeTransfer(feeCollector, amount);
+            }
+        }
     }
 
     /// @notice Calculates the invariant D
@@ -406,15 +416,24 @@ contract ForexCurvePool is
     /// @param i Index of the token to sell
     /// @param j Index of the token to buy
     /// @param dx Amount of token i to sell
+    /// @param xp Current balances adjusted for price and decimals
     /// @return dy Amount of token j to receive
-    function getDy(uint256 i, uint256 j, uint256 dx) public view returns (uint256) {
-        uint256[] memory xp = getXP();
-        uint256 x = xp[i] + ((dx * PRECISION) / (10 ** coins[i].decimals));
-        uint256 y = getY(i, j, x, xp);
-        uint256 dy = xp[j] - y - 1; // Subtract 1 to round down
+    function getDy(
+        uint256 i,
+        uint256 j,
+        uint256 dx,
+        uint256[] memory xp
+    ) internal view returns (uint256) {
+        uint256[] memory xpAdjusted = new uint256[](xp.length);
+        for (uint256 k = 0; k < xp.length; k++) {
+            xpAdjusted[k] = xp[k];
+        }
 
-        uint256 dy_fee = (dy * fee) / FEE_DENOMINATOR;
-        dy = (dy - dy_fee) * (10 ** coins[j].decimals) / PRECISION;
+        uint256 x = xpAdjusted[i] + ((dx * PRECISION) / (10 ** coins[i].decimals));
+        uint256 y = getY(i, j, x, xpAdjusted);
+        uint256 dy = xpAdjusted[j] - y - 1; // Subtract 1 to round down
+
+        dy = (dy * (10 ** coins[j].decimals)) / PRECISION;
 
         return dy;
     }
